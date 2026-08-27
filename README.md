@@ -92,10 +92,12 @@ token-stat/
 │   └── client.js         # 浏览器半面:设置页「Token 用量统计」卡片
 └── tools/                # 开发/自检脚本
     ├── install.mjs       # 开发模式安装:junction + 维护 profile patch(幂等)
-    ├── verify-load.mjs   # 模拟 loader 解析链路 + 数据隔离 + 客户端元数据校验
+    ├── verify-load.mjs   # 模拟 loader 解析链路 + 数据隔离 + 客户端元数据 + bundle 清单校验
     ├── replay-sessions.mjs # 离线全量回放(全部历史会话 → 报告 + 数据质量诊断)
     ├── test-fold.mjs     # 折叠语义单元测试(8 组)
-    └── smoke-test.mjs    # 插件加载冒烟测试(含 settings/webServer 桥、目录迁移)
+    ├── smoke-test.mjs    # 插件加载冒烟测试(含 settings/webServer 桥、目录迁移)
+    ├── publish-github.mjs  # 用 gh REST 把本仓库发布到 GitHub(无需本地 git)
+    └── submit-list-pr.mjs  # 向 awesome-dsh-plugin 列表仓库提交条目并开 PR(无需本地 git)
 ```
 
 ## 本地开发 / 自检
