@@ -9,87 +9,9 @@
  *   node tools/replay-sessions.mjs [--out <dir>] [--no-write]
  */
 
-import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
-import * as zlib from 'node:zlib'
-import { foldEvents, buildSnapshot, renderMarkdown, renderJson } from '../index.mjs'
-
-const ZSTD_MAGIC = 0xfd2fb528
-
-function scanZstdFrames(buffer) {
-  const frames = []
-  let offset = 0
-  while (offset < buffer.length) {
-    const start = offset
-    if (buffer.length - offset < 4) return { frames, tornStart: start }
-    if (buffer.readUInt32LE(offset) !== ZSTD_MAGIC) {
-      throw new Error(`invalid frame magic at byte ${offset}`)
-    }
-    offset += 4
-    if (offset === buffer.length) return { frames, tornStart: start }
-    const descriptor = buffer.readUInt8(offset)
-    offset += 1
-    if ((descriptor & 24) !== 0) throw new Error('reserved frame-header bit')
-    const contentSizeFlag = descriptor >>> 6
-    const singleSegment = (descriptor & 32) !== 0
-    const checksum = (descriptor & 4) !== 0
-    const dictionaryFlag = descriptor & 3
-    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
-    const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag
-    const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
-    if (buffer.length - offset < remainingHeaderBytes) return { frames, tornStart: start }
-    offset += remainingHeaderBytes
-    for (;;) {
-      if (buffer.length - offset < 3) return { frames, tornStart: start }
-      const blockHeader = buffer.readUIntLE(offset, 3)
-      offset += 3
-      const lastBlock = (blockHeader & 1) !== 0
-      const blockType = (blockHeader >>> 1) & 3
-      const blockSize = blockHeader >>> 3
-      if (blockType === 3) throw new Error('reserved block type')
-      const payloadBytes = blockType === 1 ? 1 : blockSize
-      if (buffer.length - offset < payloadBytes) return { frames, tornStart: start }
-      offset += payloadBytes
-      if (lastBlock) break
-    }
-    if (checksum) {
-      if (buffer.length - offset < 4) return { frames, tornStart: start }
-      offset += 4
-    }
-    frames.push({ start, end: offset })
-  }
-  return { frames, tornStart: undefined }
-}
-
-function decodeFile(file) {
-  const raw = fs.readFileSync(file)
-  if (file.endsWith('.zstd')) {
-    const { frames, tornStart } = scanZstdFrames(raw)
-    if (tornStart !== undefined) console.warn(`  [warn] 不完整尾帧已忽略: ${file}`)
-    const parts = frames.map(({ start, end }) => zlib.zstdDecompressSync(raw.subarray(start, end)))
-    return Buffer.concat(parts, parts.reduce((n, p) => n + p.length, 0))
-  }
-  return raw
-}
-
-function walkSessionFiles(root) {
-  const out = []
-  if (!fs.existsSync(root)) return out
-  for (const project of fs.readdirSync(root, { withFileTypes: true })) {
-    if (!project.isDirectory()) continue
-    const sessionRoot = path.join(root, project.name)
-    for (const sessionDir of fs.readdirSync(sessionRoot, { withFileTypes: true })) {
-      if (!sessionDir.isDirectory()) continue
-      for (const name of fs.readdirSync(path.join(sessionRoot, sessionDir.name))) {
-        if (name.startsWith('session') && (name.endsWith('.zstd') || name.endsWith('.jsonl'))) {
-          out.push(path.join(sessionRoot, sessionDir.name, name))
-        }
-      }
-    }
-  }
-  return out
-}
+import { foldEvents, buildSnapshot, renderMarkdown, renderJson, walkSessionFiles, parseSessionFile } from '../index.mjs'
 
 const args = process.argv.slice(2)
 const writeOut = !args.includes('--no-write')
@@ -121,13 +43,7 @@ const diag = {
 for (const file of files) {
   let events = []
   try {
-    const buf = decodeFile(file)
-    const lines = buf.toString('utf8').split(/\r?\n/).filter((l) => l.trim().length > 0)
-    for (const line of lines) {
-      const parsed = JSON.parse(line)
-      if (parsed && parsed.type === 'session') continue // 头行
-      events.push(parsed)
-    }
+    events = await parseSessionFile(file)
     diag.events += events.length
     for (const e of events) {
       if (e.type !== 'assistant/message') continue
