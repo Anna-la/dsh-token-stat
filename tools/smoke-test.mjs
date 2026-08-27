@@ -41,6 +41,7 @@ process.env.DSH_TOKEN_STAT_DATA_DIR = path.join(TEMP, 'auto')
 // 这正对应线上缺陷场景 —— 重启时持久化服务尚未就绪(list 为空),
 // 插件必须能直接扫到磁盘上的全部历史会话。
 const SID = 'disk-session-1'
+const SID2 = 'disk-session-2'
 const sessionDir = path.join(TEMP, 'sessions', 'proj-a', SID)
 fs.mkdirSync(sessionDir, { recursive: true })
 const sessionEvents = [
@@ -306,9 +307,9 @@ refreshStatus = null
 await refreshRoute.handler({ ...loopbackReq, headers: { host: '127.0.0.1:1681' }, method: 'POST' }, refreshRes)
 assert.equal(refreshStatus, 200, 'refresh POST 应 200')
 await new Promise((r) => setTimeout(r, 400))
-console.log('ok: /api/token-stat/refresh (GET 405 / POST 重建扫描)')
+console.log('ok: /api/token-stat/refresh (GET 405 / POST 重新扫描)')
 
-// 重建扫描 → 磁盘新事件必须计入归档账本(同一 id 覆盖更新,不重复计数)
+// 重新扫描 → 磁盘新事件必须计入归档账本(同一 id 覆盖更新,不重复计数)
 {
   // 往磁盘会话文件追加一个 turn=2 的 assistant/message(input 33 / output 11)
   const file = path.join(sessionDir, 'session.jsonl.zstd')
@@ -336,13 +337,33 @@ console.log('ok: /api/token-stat/refresh (GET 405 / POST 重建扫描)')
   await new Promise((r) => setTimeout(r, 900))
 
   const snapR = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
-  assert.equal(snapR.totals.inputTokens, 144, '重建扫描应计入磁盘新事件 (111+33)')
-  assert.equal(snapR.totals.outputTokens, 33, '重建扫描应计入磁盘新事件 (22+11)')
+  assert.equal(snapR.totals.inputTokens, 144, '重新扫描应计入磁盘新事件 (111+33)')
+  assert.equal(snapR.totals.outputTokens, 33, '重新扫描应计入磁盘新事件 (22+11)')
   assert.equal(snapR.sessionCount, 1)
   const arcR = JSON.parse(fs.readFileSync(path.join(reportDir, 'archive.json'), 'utf8'))
   assert.equal(arcR.sessions[SID].usageCalls, 2, '归档同一 id 应覆盖更新为 2 次请求(而非累计/重复)')
   assert.equal(arcR.sessions[SID].models[0][1].inputTokens, 144, '归档快照应含新事件')
-  console.log('ok: 重建扫描写入归档 (同一 id 覆盖更新, 不重复计数; 手动点按钮后数据入库)')
+
+  // 磁盘出现新会话 SID2 -> 重新扫描应并入(不清空已有数据库)
+  const dir2 = path.join(TEMP, 'sessions', 'proj-a', SID2)
+  fs.mkdirSync(dir2, { recursive: true })
+  fs.writeFileSync(path.join(dir2, 'session.jsonl'), sessionEvents.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8')
+  await refreshRoute.handler({ ...loopbackReq, method: 'POST' }, rsRes)
+  await new Promise((r) => setTimeout(r, 900))
+  const snapR2 = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
+  assert.equal(snapR2.totals.inputTokens, 255, 'SID(144) + SID2(111) = 255,重新扫描应并入新会话')
+  assert.equal(snapR2.sessionCount, 2)
+
+  // SID2 的会话文件被删除 -> 再次重新扫描: 归档保留其用量(不清空已有数据库)
+  fs.rmSync(dir2, { recursive: true, force: true })
+  await refreshRoute.handler({ ...loopbackReq, method: 'POST' }, rsRes)
+  await new Promise((r) => setTimeout(r, 900))
+  const snapR3 = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
+  assert.equal(snapR3.totals.inputTokens, 255, '删除 SID2 文件后重新扫描,归档应保留其用量')
+  assert.equal(snapR3.sessionCount, 2, '已删除会话仍计入(归档保留)')
+  const arcR3 = JSON.parse(fs.readFileSync(path.join(reportDir, 'archive.json'), 'utf8'))
+  assert.equal(arcR3.sessions[SID2].usageCalls, 1, '归档保留 SID2')
+  console.log('ok: 重新扫描并入新会话且不清空数据库 (已删除会话用量保留, 同一 id 覆盖更新)')
 }
 
 // ---- 3.3) 数据保存目录修改(/config) ----
@@ -430,11 +451,12 @@ fs.rmSync(path.join(TEMP, 'sessions'), { recursive: true, force: true }) // 模�
   applyAndWait(ctx2, { enabled: true, reportDir: '', writeMd: true, writeJson: true, debounceMs: 25 })
   await new Promise((r) => setTimeout(r, 700))
   const snap2 = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
-  assert.equal(snap2.totals.inputTokens, 144, '会话文件删除后,归档应保留其用量(重建扫描后的最新快照)')
-  assert.equal(snap2.totals.outputTokens, 33)
-  assert.equal(snap2.sessionCount, 1, '归档中的会话仍计入会话数')
+  assert.equal(snap2.totals.inputTokens, 255, '会话文件删除后,归档应保留其用量(SID 144 + SID2 111)')
+  assert.equal(snap2.totals.outputTokens, 55)
+  assert.equal(snap2.sessionCount, 2, '归档中的会话仍计入会话数')
   const archiveDoc2 = JSON.parse(fs.readFileSync(path.join(reportDir, 'archive.json'), 'utf8'))
-  assert.ok(archiveDoc2.sessions[SID], '归档应仍含被删除会话')
+  assert.ok(archiveDoc2.sessions[SID], '归档应仍含被删除会话 SID')
+  assert.ok(archiveDoc2.sessions[SID2], '归档应仍含被删除会话 SID2')
   console.log('ok: 归档保留 (删除会话文件后重新加载仍计入, 总量不变; effect 计数', disposers, ')')
 }
 
@@ -448,15 +470,107 @@ const TEMP2 = fs.mkdtempSync(path.join(os.tmpdir(), 'token-stat-fallback-'))
   applyAndWait(ctx3, { enabled: true, reportDir: '', writeMd: true, writeJson: true, debounceMs: 25 })
   await new Promise((r) => setTimeout(r, 500))
   const snap3 = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
-  assert.equal(snap3.totals.inputTokens, 255, '归档(SID 144) + 服务会话(111) = 255')
-  assert.equal(snap3.totals.outputTokens, 55, '33 + 22 = 55')
-  assert.equal(snap3.sessionCount, 2, '归档与会话服务数据应合并')
+  assert.equal(snap3.totals.inputTokens, 366, '归档(SID 144 + SID2 111) + 服务会话(111) = 366')
+  assert.equal(snap3.totals.outputTokens, 77, '33 + 22 + 22 = 77')
+  assert.equal(snap3.sessionCount, 3, '归档与会话服务数据应合并')
   process.env.DSH_HOME = savedHome
   console.log('ok: 持久化服务兜底 (无磁盘会话时走 sessionPersistence, 与归档合并)')
 }
 
+// ---- 6) 清空插件数据库(/clear): 置零 + 历史会话标记忽略,新会话正常统计 ----
+const TEMP3 = fs.mkdtempSync(path.join(os.tmpdir(), 'token-stat-clear-'))
+{
+  const savedHome = process.env.DSH_HOME
+  const savedDataDir = process.env.DSH_TOKEN_STAT_DATA_DIR
+  process.env.DSH_HOME = TEMP3
+  process.env.DSH_TOKEN_STAT_DATA_DIR = path.join(TEMP3, 'auto')
+
+  const SID3 = 'clear-session-1'
+  const dir3 = path.join(TEMP3, 'sessions', 'proj-c', SID3)
+  fs.mkdirSync(dir3, { recursive: true })
+  fs.writeFileSync(path.join(dir3, 'session.jsonl'), sessionEvents.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8')
+
+  const routes3 = []
+  const ctx4 = {
+    logger: { info: () => {}, warn: (...a) => console.log('  [warn]', a.join(' ')) },
+    get(n) {
+      if (n === 'tools') return { register() {} }
+      if (n === 'settings') return { register() { return { get: () => ({}), watch() {}, update() {} } } }
+      if (n === 'webServer') return { register(r) { routes3.push(r) } }
+      if (n === 'sessions') return { list: () => [] }
+      if (n === 'sessionPersistence') return { list: async () => [], readFrom: async () => ({ events: [] }) }
+      return undefined
+    },
+    on() {},
+    inject(names, cb) { cb({ get: (n) => ctx4.get(n), effect() {} }) },
+    effect() { return () => {} },
+  }
+  plugin.apply(ctx4, { enabled: true, reportDir: '', writeMd: true, writeJson: true, debounceMs: 25 })
+  await new Promise((r) => setTimeout(r, 600))
+
+  const stats3 = routes3.find((r) => r.path === '/api/token-stat/stats').handler
+  const clear3 = routes3.find((r) => r.path === '/api/token-stat/clear')
+  const refresh3 = routes3.find((r) => r.path === '/api/token-stat/refresh').handler
+  assert.ok(clear3 && typeof clear3.handler === 'function', '应注册 /clear 路由')
+
+  const readStats = async () => {
+    let b = null
+    const res = {
+      writeHead(status, headers) { b = { status, headers } },
+      end(payload) { b.body = JSON.parse(payload) },
+    }
+    await stats3({ socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:1' }, method: 'GET' }, res)
+    return b.body.value.snapshot
+  }
+  const post = async (route) => {
+    let s = null
+    const res = {
+      writeHead(status) { s = status },
+      end() {},
+    }
+    await route({ socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:1' }, method: 'POST' }, res)
+    return s
+  }
+  const req = { socket: { remoteAddress: '127.0.0.1' }, headers: { host: '127.0.0.1:1' }, method: 'GET' }
+  let clearStatus = null
+  const clearRes = { writeHead(status) { clearStatus = status }, end() {} }
+  await clear3.handler({ ...req, method: 'GET' }, clearRes)
+  assert.equal(clearStatus, 405, 'clear 只允许 POST')
+
+  const snapA = await readStats()
+  assert.equal(snapA.totals.inputTokens, 111, '清空前应有数据')
+  assert.equal(await post(clear3.handler), 200, '清空应 200')
+  await new Promise((r) => setTimeout(r, 600))
+  const snapB = await readStats()
+  assert.equal(snapB.totals.inputTokens, 0, '清空后总量应为 0')
+  assert.equal(snapB.sessionCount, 0)
+  const arcB = JSON.parse(fs.readFileSync(path.join(TEMP3, 'auto', 'archive.json'), 'utf8'))
+  assert.ok(arcB.ignored.includes(SID3), '清空后历史会话应标记忽略')
+  assert.equal(Object.keys(arcB.sessions).length, 0, '归档应清空')
+
+  await post(refresh3) // 重新扫描: 被忽略的历史会话不会被重新导入
+  await new Promise((r) => setTimeout(r, 600))
+  const snapC = await readStats()
+  assert.equal(snapC.totals.inputTokens, 0, '清空后重新扫描不应重新导入历史会话')
+
+  const SID4 = 'clear-session-2' // 新会话正常统计
+  const dir4 = path.join(TEMP3, 'sessions', 'proj-c', SID4)
+  fs.mkdirSync(dir4, { recursive: true })
+  fs.writeFileSync(path.join(dir4, 'session.jsonl'), sessionEvents.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8')
+  await post(refresh3)
+  await new Promise((r) => setTimeout(r, 600))
+  const snapD = await readStats()
+  assert.equal(snapD.totals.inputTokens, 111, '新会话应正常统计')
+  assert.equal(snapD.sessionCount, 1)
+
+  process.env.DSH_HOME = savedHome
+  process.env.DSH_TOKEN_STAT_DATA_DIR = savedDataDir
+  console.log('ok: /clear 清空插件数据库 (置零 + 历史会话忽略不再导入, 新会话正常统计)')
+}
+
 fs.rmSync(TEMP, { recursive: true, force: true })
 fs.rmSync(TEMP2, { recursive: true, force: true })
+fs.rmSync(TEMP3, { recursive: true, force: true })
 fs.rmSync(plugin.pluginDataDir(), { recursive: true, force: true })
 console.log('\n冒烟测试通过 ✓')
 
