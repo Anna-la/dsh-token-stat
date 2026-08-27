@@ -1,0 +1,12 @@
+# dsh-token-stat bundle 补丁层(由根 package.json 的 dsh.bundle.patch 引用)。
+#
+# 安装方式(任选):
+#   dsh plugin --profile <name> add github:<owner>/token-stat
+#   dsh plugin --profile <name> add ./<本仓库路径>
+#   或从 dsh 插件市场粘贴本仓库地址安装
+#
+# 本层把插件挂进 loader:name 是包名,安装后由 profile 依赖解析到 lib/index.js
+# (服务端入口)与 lib/client.js(dsh.client 声明的浏览器半面)。
+- insert:
+    - id: token-stat
+      name: token-stat
