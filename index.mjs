@@ -766,9 +766,24 @@ export function apply(ctx, config) {
     }
   }
 
+  /**
+   * 写入归档账本: 同一 id 覆盖更新(不重复计数)。
+   * 保险: 会话日志是追加式的,折叠的 usageCalls 只会增长 —— 若读到的是
+   * 局部/截断文件导致快照变小,拒绝用较小值覆盖,保证账本永不缩水。
+   */
+  function archiveSetFold(id, fold) {
+    if (!fold) return
+    const prev = archive.get(id)
+    if (prev && fold.usageCalls < prev.usageCalls) {
+      logger.warn?.('[token-stat] 归档拒绝较小快照(可能是截断文件):', id, prev.usageCalls, '->', fold.usageCalls)
+      return
+    }
+    archive.set(id, fold)
+  }
+
   /** 快照来源 = 当前 folds + 归档中已不在当前列表的会话(删除后仍计入)。 */
   function snapshotFoldValues() {
-    for (const [id, fold] of folds) archive.set(id, fold)
+    for (const [id, fold] of folds) archiveSetFold(id, fold)
     const values = [...folds.values()]
     for (const [id, fold] of archive) if (!folds.has(id)) values.push(fold)
     return values
@@ -859,7 +874,7 @@ export function apply(ctx, config) {
     try {
       await mkdir(reportDir, { recursive: true })
       // 先把当前 folds 同步进归档,再写报告与归档(归档是删除会话后仍保留用量的关键)
-      for (const [id, fold] of folds) archive.set(id, fold)
+      for (const [id, fold] of folds) archiveSetFold(id, fold)
       if (config.writeJson) {
         await writeFile(jsonPath, renderJson(buildSnapshot(snapshotFoldValues()), { ...meta, reportPath: jsonPath }), 'utf8')
       }
