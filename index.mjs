@@ -9,6 +9,10 @@
  *    供应商上报的精确 token 数(与官方 dsh-token-meter 同一数据源/口径)。
  *  - 同一 (turn, step) 步内重试/重复上报的 usage 只采纳最后一次采样,
  *    不会重复计数(与 dsh-token-meter 的 tokenUsage 投影语义一致)。
+ *  - 启动即全量统计: 插件加载后直接扫描 <DSH_HOME>/sessions 磁盘会话日志
+ *    (不依赖会话服务就绪),覆盖所有项目 —— 包括已关闭、已从列表删除但日志
+ *    仍在磁盘的项目;并维护一份「归档账本」(archive.json, 随报告目录存储),
+ *    即使某个会话的文件之后被彻底删除,其最后已知用量也仍然计入总数。
  *  - 设置页入口: 在「设置 → 插件 → 可配置」里出现一张「Token 用量统计」卡片,
  *    点击展开即显示累计用量(总数 / 按模型 / 按日期),数据由本插件提供的
  *    webServer 桥 (/api/token-stat/stats) 实时供给;
@@ -29,7 +33,9 @@
 
 import * as os from 'node:os'
 import * as path from 'node:path'
-import { mkdir, writeFile, rename, stat } from 'node:fs/promises'
+import * as zlib from 'node:zlib'
+import * as fsSync from 'node:fs'
+import { mkdir, writeFile, rename, stat, readdir, readFile } from 'node:fs/promises'
 
 export const name = 'token-stat'
 
@@ -285,6 +291,158 @@ export function foldEvents(events) {
 }
 
 // ---------------------------------------------------------------------------
+// 会话日志文件解码(<DSH_HOME>/sessions/<项目>/<会话>/session*.zstd|jsonl)
+// 与 tools/replay-sessions.mjs 同源;zstd 帧扫描为手写实现(零依赖)。
+// ---------------------------------------------------------------------------
+
+const ZSTD_MAGIC = 0xfd2fb528
+const SESSION_FILE_RE = /^session(?:[^/\\]*)?\.(zstd|jsonl)$/i
+
+/** 扫描 zstd 帧边界(Node 的 zstdDecompressSync 一次只能解一帧,需自行分帧)。 */
+export function scanZstdFrames(buffer) {
+  const frames = []
+  let offset = 0
+  while (offset < buffer.length) {
+    const start = offset
+    if (buffer.length - offset < 4) return { frames, tornStart: start }
+    if (buffer.readUInt32LE(offset) !== ZSTD_MAGIC) throw new Error(`invalid frame magic at byte ${offset}`)
+    offset += 4
+    if (offset === buffer.length) return { frames, tornStart: start }
+    const descriptor = buffer.readUInt8(offset)
+    offset += 1
+    if ((descriptor & 24) !== 0) throw new Error('reserved frame-header bit')
+    const contentSizeFlag = descriptor >>> 6
+    const singleSegment = (descriptor & 32) !== 0
+    const checksum = (descriptor & 4) !== 0
+    const dictionaryFlag = descriptor & 3
+    const dictionaryBytes = dictionaryFlag === 3 ? 4 : dictionaryFlag
+    const contentSizeBytes = contentSizeFlag === 0 ? (singleSegment ? 1 : 0) : 1 << contentSizeFlag
+    const remainingHeaderBytes = (singleSegment ? 0 : 1) + dictionaryBytes + contentSizeBytes
+    if (buffer.length - offset < remainingHeaderBytes) return { frames, tornStart: start }
+    offset += remainingHeaderBytes
+    for (;;) {
+      if (buffer.length - offset < 3) return { frames, tornStart: start }
+      const blockHeader = buffer.readUIntLE(offset, 3)
+      offset += 3
+      const lastBlock = (blockHeader & 1) !== 0
+      const blockType = (blockHeader >>> 1) & 3
+      const blockSize = blockHeader >>> 3
+      if (blockType === 3) throw new Error('reserved block type')
+      const payloadBytes = blockType === 1 ? 1 : blockSize
+      if (buffer.length - offset < payloadBytes) return { frames, tornStart: start }
+      offset += payloadBytes
+      if (lastBlock) break
+    }
+    if (checksum) {
+      if (buffer.length - offset < 4) return { frames, tornStart: start }
+      offset += 4
+    }
+    frames.push({ start, end: offset })
+  }
+  return { frames, tornStart: undefined }
+}
+
+/** 把 .zstd / 明文日志解码成 UTF-8 文本(不完整尾帧忽略)。 */
+export function decodeSessionBuffer(fileName, buffer) {
+  if (/\.zstd$/i.test(fileName)) {
+    if (typeof zlib.zstdDecompressSync !== 'function') throw new Error('当前 Node 不支持 zstd(需要 Node >= 22.5)')
+    const { frames } = scanZstdFrames(buffer)
+    const parts = frames.map(({ start, end }) => zlib.zstdDecompressSync(buffer.subarray(start, end)))
+    return Buffer.concat(parts, parts.reduce((n, p) => n + p.length, 0)).toString('utf8')
+  }
+  return buffer.toString('utf8')
+}
+
+/** 遍历 <sessions>/<项目>/<会话>/session*.{zstd,jsonl},返回文件绝对路径列表。 */
+export function walkSessionFiles(root) {
+  const out = []
+  let projects
+  try {
+    projects = fsSync.readdirSync(root, { withFileTypes: true })
+  } catch {
+    return out
+  }
+  for (const project of projects) {
+    if (!project.isDirectory()) continue
+    let sessionDirs
+    try {
+      sessionDirs = fsSync.readdirSync(path.join(root, project.name), { withFileTypes: true })
+    } catch {
+      continue
+    }
+    for (const sessionDir of sessionDirs) {
+      if (!sessionDir.isDirectory()) continue
+      let names
+      try {
+        names = fsSync.readdirSync(path.join(root, project.name, sessionDir.name))
+      } catch {
+        continue
+      }
+      for (const name of names) {
+        if (SESSION_FILE_RE.test(name)) out.push(path.join(root, project.name, sessionDir.name, name))
+      }
+    }
+  }
+  return out.sort() // 确定性顺序(同目录多文件时第一个优先)
+}
+
+/** 解析一个会话文件为事件数组(跳过 session 头行)。 */
+export async function parseSessionFile(file) {
+  const buffer = await readFile(file)
+  const text = decodeSessionBuffer(path.basename(file), buffer)
+  const events = []
+  for (const line of text.split(/\r?\n/)) {
+    if (!line.trim()) continue
+    const parsed = JSON.parse(line)
+    if (parsed && parsed.type === 'session') continue
+    events.push(parsed)
+  }
+  return events
+}
+
+// ---------------------------------------------------------------------------
+// 归档账本: sessionId -> 最后已知 fold(会话文件被删除后仍保留其用量)
+// ---------------------------------------------------------------------------
+
+/** fold(含 Map) -> 可 JSON 序列化的普通对象。 */
+export function serializeFold(fold) {
+  if (!fold) return null
+  return {
+    models: [...fold.models.entries()],
+    days: [...fold.days.entries()],
+    last: fold.last,
+    route: fold.route,
+    messageCount: fold.messageCount,
+    usageCount: fold.usageCount,
+    usageCalls: fold.usageCalls,
+  }
+}
+
+/** 归档对象 -> fold。 */
+export function deserializeFold(obj) {
+  if (!obj || typeof obj !== 'object') return null
+  const fold = createFold()
+  fold.models = new Map(Array.isArray(obj.models) ? obj.models : [])
+  fold.days = new Map(Array.isArray(obj.days) ? obj.days : [])
+  fold.last = obj.last ?? null
+  fold.route = obj.route ?? null
+  fold.messageCount = typeof obj.messageCount === 'number' ? obj.messageCount : 0
+  fold.usageCount = typeof obj.usageCount === 'number' ? obj.usageCount : 0
+  fold.usageCalls = typeof obj.usageCalls === 'number' ? obj.usageCalls : 0
+  return fold
+}
+
+/** 归档账本 -> JSON 文档。 */
+export function renderArchive(archive) {
+  const sessions = {}
+  for (const [id, fold] of archive) {
+    const s = serializeFold(fold)
+    if (s) sessions[id] = s
+  }
+  return `${JSON.stringify({ version: 1, updatedAt: Date.now(), sessions }, null, 2)}\n`
+}
+
+// ---------------------------------------------------------------------------
 // 汇总快照
 // ---------------------------------------------------------------------------
 
@@ -523,7 +681,7 @@ function normalizeReportDir(raw) {
     : pluginDataDir()
 }
 
-/** 迁移既有报告文件(report.md / report.json)到新目录;返回是否发生迁移。 */
+/** 迁移既有报告文件(report.md / report.json / archive.json)到新目录;返回是否发生迁移。 */
 async function migrateReportData(fromDir, toDir) {
   if (fromDir === toDir) return false
   let fromStat = null
@@ -535,7 +693,7 @@ async function migrateReportData(fromDir, toDir) {
   if (!fromStat.isDirectory()) return false
   await mkdir(toDir, { recursive: true })
   let moved = 0
-  for (const fileName of ['report.md', 'report.json']) {
+  for (const fileName of ['report.md', 'report.json', 'archive.json']) {
     const src = path.join(fromDir, fileName)
     const dst = path.join(toDir, fileName)
     try {
@@ -587,6 +745,35 @@ export function apply(ctx, config) {
   /** 设置页维护的已配置报告目录(空串 = 自动默认目录),随 settings 变更更新 */
   let configuredReportDir = ''
 
+  // ----- 归档账本(随报告目录存储;会话文件被删除后仍保留其最后已知用量) -----
+  /** 会话日志根目录(<DSH_HOME>/sessions,磁盘直扫的权威来源) */
+  const sessionsRoot = path.join(dshHome, 'sessions')
+  /** sessionId -> 最后已知 fold;只有被当前 folds 覆盖时才会被替换,绝不主动删除 */
+  const archive = new Map()
+  let archivePath = path.join(reportDir, 'archive.json')
+  loadArchiveSync()
+
+  function loadArchiveSync() {
+    try {
+      const raw = fsSync.readFileSync(archivePath, 'utf8')
+      const doc = JSON.parse(raw)
+      for (const [id, obj] of Object.entries(doc.sessions || {})) {
+        const fold = deserializeFold(obj)
+        if (id && fold) archive.set(id, fold)
+      }
+    } catch {
+      /* 首次运行或归档损坏: 从空开始 */
+    }
+  }
+
+  /** 快照来源 = 当前 folds + 归档中已不在当前列表的会话(删除后仍计入)。 */
+  function snapshotFoldValues() {
+    for (const [id, fold] of folds) archive.set(id, fold)
+    const values = [...folds.values()]
+    for (const [id, fold] of archive) if (!folds.has(id)) values.push(fold)
+    return values
+  }
+
   const ensure = (id) => {
     let f = folds.get(id)
     if (!f) {
@@ -635,6 +822,7 @@ export function apply(ctx, config) {
     s.reportDirConfigured = configuredReportDir
     s.reportMd = mdPath
     s.reportJson = jsonPath
+    s.archive = archivePath
     return s
   }
 
@@ -649,6 +837,7 @@ export function apply(ctx, config) {
     reportDir = next
     mdPath = path.join(reportDir, 'report.md')
     jsonPath = path.join(reportDir, 'report.json')
+    archivePath = path.join(reportDir, 'archive.json')
     logger.info?.('[token-stat] 数据保存目录已变更:', previous, '->', reportDir)
     void (async () => {
       try {
@@ -662,19 +851,22 @@ export function apply(ctx, config) {
 
   /** 给设置页桥/工具用的当前统计视图(纯数据)。 */
   function statsView() {
-    return { snapshot: buildSnapshot(folds.values()), meta: snapshotMeta() }
+    return { snapshot: buildSnapshot(snapshotFoldValues()), meta: snapshotMeta() }
   }
 
   async function save() {
     const meta = snapshotMeta()
     try {
       await mkdir(reportDir, { recursive: true })
+      // 先把当前 folds 同步进归档,再写报告与归档(归档是删除会话后仍保留用量的关键)
+      for (const [id, fold] of folds) archive.set(id, fold)
       if (config.writeJson) {
-        await writeFile(jsonPath, renderJson(buildSnapshot(folds.values()), { ...meta, reportPath: jsonPath }), 'utf8')
+        await writeFile(jsonPath, renderJson(buildSnapshot(snapshotFoldValues()), { ...meta, reportPath: jsonPath }), 'utf8')
       }
       if (config.writeMd) {
-        await writeFile(mdPath, renderMarkdown(buildSnapshot(folds.values()), { ...meta, reportPath: mdPath }), 'utf8')
+        await writeFile(mdPath, renderMarkdown(buildSnapshot(snapshotFoldValues()), { ...meta, reportPath: mdPath }), 'utf8')
       }
+      await writeFile(archivePath, renderArchive(archive), 'utf8')
     } catch (error) {
       logger.warn?.('[token-stat] 保存报告失败:', error)
     }
@@ -706,34 +898,59 @@ export function apply(ctx, config) {
   async function scanAll() {
     scanning = true
     try {
-      // 1) 先封存当前在内存中的会话(最新、可能尚未落盘)
-      const live = sessionsSvc ? sessionsSvc.list() : []
-      for (const session of live) seal(session.id, session.events)
-
-      // 2) 再扫磁盘上所有持久会话
-      if (persistenceSvc && typeof persistenceSvc.list === 'function') {
-        let headers
-        try {
-          headers = await persistenceSvc.list()
-        } catch (error) {
-          lastScanError = error
-        }
-        for (const header of headers || []) {
-          const id = header?.id
-          if (!id || sealed.has(id)) continue
-          try {
-            const { events } = await persistenceSvc.readFrom(id, 0)
-            if (!sealed.has(id)) seal(id, events)
-          } catch (error) {
-            lastScanError = error
-            logger.warn?.('[token-stat] 读取会话失败,已跳过:', id, String(error))
-          }
-        }
-        logger.info?.('[token-stat] 历史扫描完成,共封存会话', sealed.size, '个')
+      // 1) 当前内存中的 live 会话(最新、可能尚未落盘)
+      if (sessionsSvc && typeof sessionsSvc.list === 'function') {
+        for (const session of sessionsSvc.list()) seal(session.id, session.events)
       }
 
-      // 3) 兜底: 扫描期间新出现的 live 会话
-      if (sessionsSvc) {
+      // 2) 磁盘直扫(权威): <DSH_HOME>/sessions/<项目>/<会话>/session*.{zstd,jsonl}
+      //    不依赖会话服务是否就绪,覆盖已关闭/已删除项目(日志仍在磁盘)。
+      const files = walkSessionFiles(sessionsRoot)
+      if (files.length > 0) {
+        let sealedFromDisk = 0
+        for (const file of files) {
+          const id = path.basename(path.dirname(file))
+          if (!id || sealed.has(id)) continue
+          try {
+            const events = await parseSessionFile(file)
+            if (!sealed.has(id)) {
+              seal(id, events)
+              sealedFromDisk += 1
+            }
+          } catch (error) {
+            lastScanError = error
+            logger.warn?.('[token-stat] 读取会话文件失败,已跳过:', file, String(error))
+          }
+        }
+        logger.info?.(
+          `[token-stat] 磁盘直扫完成: 会话文件 ${files.length} 个,新封存 ${sealedFromDisk},共 ${sealed.size} 个(归档 ${archive.size} 条)`,
+        )
+      } else {
+        // 3) 兜底: 非文件型后端(SQLite 等)走持久化服务
+        if (persistenceSvc && typeof persistenceSvc.list === 'function') {
+          let headers
+          try {
+            headers = await persistenceSvc.list()
+          } catch (error) {
+            lastScanError = error
+          }
+          for (const header of headers || []) {
+            const id = header?.id
+            if (!id || sealed.has(id)) continue
+            try {
+              const { events } = await persistenceSvc.readFrom(id, 0)
+              if (!sealed.has(id)) seal(id, events)
+            } catch (error) {
+              lastScanError = error
+              logger.warn?.('[token-stat] 读取会话失败,已跳过:', id, String(error))
+            }
+          }
+          logger.info?.('[token-stat] 持久化服务扫描完成,共封存会话', sealed.size, '个(归档', archive.size, '条)')
+        }
+      }
+
+      // 4) 兜底: 扫描期间新出现的 live 会话
+      if (sessionsSvc && typeof sessionsSvc.list === 'function') {
         for (const session of sessionsSvc.list()) if (!sealed.has(session.id)) seal(session.id, session.events)
       }
     } catch (error) {
@@ -763,7 +980,7 @@ export function apply(ctx, config) {
     const tool = {
       name: 'token_usage_stats',
       description:
-        '查询 DeepSeek Harness 累计 token 用量统计(总量 + 按模型 + 按日期),数据来自会话日志中供应商上报的 usage,覆盖所有历史会话。也可在「设置 → 插件 → 可配置 → Token 用量统计」里查看实时汇总。',
+        '查询 DeepSeek Harness 累计 token 用量统计(总量 + 按模型 + 按日期),数据来自会话日志中供应商上报的 usage,启动时全量扫描磁盘会话日志,覆盖所有历史项目(含已删除项目)。也可在「设置 → 插件 → 可配置 → Token 用量统计」里查看实时汇总。',
       parameters: { type: 'object', properties: {}, additionalProperties: false },
       output: {
         schema: { type: 'string' },
