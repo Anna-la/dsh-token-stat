@@ -308,6 +308,43 @@ assert.equal(refreshStatus, 200, 'refresh POST 应 200')
 await new Promise((r) => setTimeout(r, 400))
 console.log('ok: /api/token-stat/refresh (GET 405 / POST 重建扫描)')
 
+// 重建扫描 → 磁盘新事件必须计入归档账本(同一 id 覆盖更新,不重复计数)
+{
+  // 往磁盘会话文件追加一个 turn=2 的 assistant/message(input 33 / output 11)
+  const file = path.join(sessionDir, 'session.jsonl.zstd')
+  const raw = plugin.decodeSessionBuffer(path.basename(file), fs.readFileSync(file))
+  const extra = {
+    type: 'assistant/message',
+    seq: 2,
+    time: Date.now() - 10000,
+    data: {
+      turn: 2,
+      step: 0,
+      message: { role: 'assistant', content: [], source: { kind: 'model', provider: 'smoke-p', model: 'smoke-m' } },
+      usage: { inputTokens: 33, outputTokens: 11 },
+    },
+  }
+  fs.writeFileSync(file, zlib.zstdCompressSync(Buffer.from(raw + JSON.stringify(extra) + '\n', 'utf8')))
+
+  let rs = null
+  const rsRes = {
+    writeHead(status) { rs = status },
+    end() {},
+  }
+  await refreshRoute.handler({ ...loopbackReq, method: 'POST' }, rsRes)
+  assert.equal(rs, 200)
+  await new Promise((r) => setTimeout(r, 900))
+
+  const snapR = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
+  assert.equal(snapR.totals.inputTokens, 144, '重建扫描应计入磁盘新事件 (111+33)')
+  assert.equal(snapR.totals.outputTokens, 33, '重建扫描应计入磁盘新事件 (22+11)')
+  assert.equal(snapR.sessionCount, 1)
+  const arcR = JSON.parse(fs.readFileSync(path.join(reportDir, 'archive.json'), 'utf8'))
+  assert.equal(arcR.sessions[SID].usageCalls, 2, '归档同一 id 应覆盖更新为 2 次请求(而非累计/重复)')
+  assert.equal(arcR.sessions[SID].models[0][1].inputTokens, 144, '归档快照应含新事件')
+  console.log('ok: 重建扫描写入归档 (同一 id 覆盖更新, 不重复计数; 手动点按钮后数据入库)')
+}
+
 // ---- 3.3) 数据保存目录修改(/config) ----
 const configRoute = routes.find((r) => r.path === '/api/token-stat/config')
 assert.ok(configRoute && typeof configRoute.handler === 'function', '应注册 config 路由')
@@ -393,7 +430,8 @@ fs.rmSync(path.join(TEMP, 'sessions'), { recursive: true, force: true }) // 模�
   applyAndWait(ctx2, { enabled: true, reportDir: '', writeMd: true, writeJson: true, debounceMs: 25 })
   await new Promise((r) => setTimeout(r, 700))
   const snap2 = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
-  assert.equal(snap2.totals.inputTokens, 111, '会话文件删除后,归档应保留其用量')
+  assert.equal(snap2.totals.inputTokens, 144, '会话文件删除后,归档应保留其用量(重建扫描后的最新快照)')
+  assert.equal(snap2.totals.outputTokens, 33)
   assert.equal(snap2.sessionCount, 1, '归档中的会话仍计入会话数')
   const archiveDoc2 = JSON.parse(fs.readFileSync(path.join(reportDir, 'archive.json'), 'utf8'))
   assert.ok(archiveDoc2.sessions[SID], '归档应仍含被删除会话')
@@ -410,7 +448,8 @@ const TEMP2 = fs.mkdtempSync(path.join(os.tmpdir(), 'token-stat-fallback-'))
   applyAndWait(ctx3, { enabled: true, reportDir: '', writeMd: true, writeJson: true, debounceMs: 25 })
   await new Promise((r) => setTimeout(r, 500))
   const snap3 = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
-  assert.equal(snap3.totals.inputTokens, 222, '归档(SID) + 服务会话 = 222')
+  assert.equal(snap3.totals.inputTokens, 255, '归档(SID 144) + 服务会话(111) = 255')
+  assert.equal(snap3.totals.outputTokens, 55, '33 + 22 = 55')
   assert.equal(snap3.sessionCount, 2, '归档与会话服务数据应合并')
   process.env.DSH_HOME = savedHome
   console.log('ok: 持久化服务兜底 (无磁盘会话时走 sessionPersistence, 与归档合并)')
