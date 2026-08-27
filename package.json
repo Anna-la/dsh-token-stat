@@ -1,0 +1,32 @@
+{
+  "name": "token-stat",
+  "version": "1.0.0",
+  "private": true,
+  "description": "DeepSeek Harness token 用量统计插件: 累计用量按模型/日期区分, 设置页看板, 可在线更改数据保存目录",
+  "type": "module",
+  "main": "lib/index.js",
+  "exports": {
+    ".": "./lib/index.js",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "inject": [
+        "@deepseek-ai/dsh-client-runtime"
+      ]
+    }
+  },
+  "keywords": [
+    "dsh",
+    "dsh-plugin",
+    "token",
+    "usage",
+    "statistics"
+  ],
+  "license": "MIT"
+}
