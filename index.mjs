@@ -432,14 +432,14 @@ export function deserializeFold(obj) {
   return fold
 }
 
-/** 归档账本 -> JSON 文档。 */
-export function renderArchive(archive) {
+/** 归档账本 -> JSON 文档(version 2 增加 ignored 列表)。 */
+export function renderArchive(archive, ignored = []) {
   const sessions = {}
   for (const [id, fold] of archive) {
     const s = serializeFold(fold)
     if (s) sessions[id] = s
   }
-  return `${JSON.stringify({ version: 1, updatedAt: Date.now(), sessions }, null, 2)}\n`
+  return `${JSON.stringify({ version: 2, updatedAt: Date.now(), ignored: [...ignored], sessions }, null, 2)}\n`
 }
 
 // ---------------------------------------------------------------------------
@@ -750,6 +750,8 @@ export function apply(ctx, config) {
   const sessionsRoot = path.join(dshHome, 'sessions')
   /** sessionId -> 最后已知 fold;只有被当前 folds 覆盖时才会被替换,绝不主动删除 */
   const archive = new Map()
+  /** 被「清空插件数据库」标记为忽略的会话 id(清空后不再从磁盘重新导入) */
+  const ignored = new Set()
   let archivePath = path.join(reportDir, 'archive.json')
   loadArchiveSync()
 
@@ -761,6 +763,7 @@ export function apply(ctx, config) {
         const fold = deserializeFold(obj)
         if (id && fold) archive.set(id, fold)
       }
+      for (const id of doc.ignored || []) if (typeof id === 'string') ignored.add(id)
     } catch {
       /* 首次运行或归档损坏: 从空开始 */
     }
@@ -789,6 +792,21 @@ export function apply(ctx, config) {
     return values
   }
 
+  /**
+   * 清空插件数据库: 归档账本 + 当前统计全部置零,并把所有已知会话 id 标记为
+   * 忽略 —— 之后「重新扫描」/重启都不会再把这些历史会话灌回来(新会话正常统计)。
+   */
+  function clearDatabase() {
+    for (const id of folds.keys()) ignored.add(id)
+    for (const id of archive.keys()) ignored.add(id)
+    folds.clear()
+    sealed.clear()
+    pending.clear()
+    archive.clear()
+    logger.info?.('[token-stat] 插件数据库已清空(归档置零;历史会话已标记忽略,不会自动重新导入)')
+    void save()
+  }
+
   const ensure = (id) => {
     let f = folds.get(id)
     if (!f) {
@@ -798,10 +816,11 @@ export function apply(ctx, config) {
     return f
   }
 
-  /** 实时事件入口: 未 seal 的会话先进缓冲,seal 后立即应用。 */
+  /** 实时事件入口: 未 seal 的会话先进缓冲,seal 后立即应用。被清空忽略的会话直接丢弃。 */
   function onSessionEvent(session, event) {
     const id = session?.id
     if (!id || !event) return
+    if (ignored.has(id)) return
     if (!sealed.has(id)) {
       let q = pending.get(id)
       if (!q) {
@@ -815,9 +834,9 @@ export function apply(ctx, config) {
     scheduleSave()
   }
 
-  /** 封存: 全量回放主事件 + 缓冲中新事件(seal 幂等)。 */
+  /** 封存: 全量回放主事件 + 缓冲中新事件(seal 幂等;被清空忽略的会话不封存)。 */
   function seal(id, events) {
-    if (sealed.has(id)) return
+    if (!id || sealed.has(id) || ignored.has(id)) return
     const q = pending.get(id) || []
     pending.delete(id)
     folds.set(id, foldEvents([...(events || []), ...q]))
@@ -881,7 +900,7 @@ export function apply(ctx, config) {
       if (config.writeMd) {
         await writeFile(mdPath, renderMarkdown(buildSnapshot(snapshotFoldValues()), { ...meta, reportPath: mdPath }), 'utf8')
       }
-      await writeFile(archivePath, renderArchive(archive), 'utf8')
+      await writeFile(archivePath, renderArchive(archive, ignored), 'utf8')
     } catch (error) {
       logger.warn?.('[token-stat] 保存报告失败:', error)
     }
@@ -978,8 +997,12 @@ export function apply(ctx, config) {
     }
   }
 
-  /** 从磁盘整体重建一次(幂等: 每个会话都从全量事件重新折叠,不会重复计数)。 */
-  async function rescanFromDisk() {
+  /**
+   * 「重新扫描」: 从磁盘全量重新折叠(幂等,不会重复计数),并覆盖更新归档账本。
+   * 只重建「当前统计折叠」,归档账本(插件数据库)不受影响 —— 已删除会话的
+   * 用量保留,被「清空插件数据库」标记忽略的会话不会被重新导入。
+   */
+  async function rescanAll() {
     sealed.clear()
     pending.clear()
     await scanAll()
@@ -1059,8 +1082,21 @@ export function apply(ctx, config) {
               writeJson(res, 405, { ok: false, error: 'method not allowed' })
               return
             }
-            void rescanFromDisk()
+            void rescanAll()
             writeJson(res, 200, { ok: true, status: 'scanning' })
+          },
+        },
+        {
+          kind: 'exact',
+          path: `${BRIDGE_PREFIX}/clear`,
+          handler: async (req, res) => {
+            if (!guard(req, res)) return
+            if (req.method !== 'POST') {
+              writeJson(res, 405, { ok: false, error: 'method not allowed' })
+              return
+            }
+            clearDatabase()
+            writeJson(res, 200, { ok: true, value: { cleared: true, sessions: 0, ignored: ignored.size } })
           },
         },
         {
