@@ -41,17 +41,21 @@ dsh plugin --profile <profile> add ./path/to/token-stat
    卡片数据由插件自带的桥 `/api/token-stat/stats` 提供（仅回环地址可访问，
    外部请求一律 403），每 15 秒自动刷新。
 2. **更改数据保存目录**：同一张卡片里的「数据保存目录」一栏：
-   - 输入新目录 → 点「保存」：立即生效，并把旧的 `report.md` / `report.json`
-     **自动迁移**到新目录（跨盘移动不支持时会在新目录重建）；
+   - 输入新目录 → 点「保存」：立即生效，并把旧的 `report.md` / `report.json` /
+     `archive.json` **自动迁移**到新目录（跨盘移动不支持时会在新目录重建）；
    - 点「恢复默认」：清空设置，回到默认数据目录（`~/.dsh-token-stat`）。
    设置写入官方 settings 用户层（`settings.yaml`），重启后仍生效；
    也可在 `cordis.patch.yml` 的 `config.reportDir` 预设。
-3. **自动统计**：插件加载后即扫描全部历史会话日志，此后实时监听
-   `session/event` 增量累计（含子 agent 会话）。
+3. **自动统计**：插件加载后即**直接扫描 `<DSH_HOME>/sessions` 磁盘会话日志**
+   （不依赖会话服务就绪），覆盖**所有项目——包括已关闭、已删除但日志仍在磁盘的
+   项目**；此后实时监听 `session/event` 增量累计（含子 agent 会话）。
+   每个会话的用量会写入「归档账本」（`archive.json`，随报告目录存储），
+   即使之后某个会话的文件被彻底删除，其最后已知用量也仍然计入总数。
 4. **随时查询**：在对话框里问"查一下 token 用量统计"，模型会调用本插件的
    `token_usage_stats` 工具并返回报告文本。
 5. **报告文件**：默认写入 `~/.dsh-token-stat\` 下的
-   `report.md` + `report.json`（可在设置页卡片里随时改目录）。
+   `report.md` + `report.json` + `archive.json`（可在设置页卡片里随时改目录，
+   三个文件会一起迁移）。
 
 ## 配置（可选，均为默认值）
 
@@ -77,6 +81,11 @@ dsh plugin --profile <profile> add ./path/to/token-stat
   **供应商上报的精确 token 数**。
 - 同一 `(turn, step)` 内重试采样的 usage 互相替换（与 `dsh-token-meter` 的
   `tokenUsage` 投影语义一致），避免重复计数。
+- 会话来源：优先磁盘直扫 `<DSH_HOME>/sessions/<项目>/<会话>/session*.zstd|jsonl`
+  （全部历史，含已删除项目）；仅当磁盘无会话文件（如 SQLite 存储后端）时
+  才回退到 `sessionPersistence` 服务。
+- 归档账本 `archive.json`：按会话 id 记录最后已知用量；当前磁盘/内存里已不存在的
+  会话（被彻底删除）仍会计入总数，且不会重复计数（同一 id 的更新覆盖旧值）。
 - 绝大多数消息（99.5%+）都带 usage；个别缺失 usage 的消息只计条数不计 token。
 - 模型归属：消息自带 `source` → 最近一次 `request/context` 路由 → `unknown`。
 
