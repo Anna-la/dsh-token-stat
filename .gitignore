@@ -1,0 +1,21 @@
+# 依赖与构建产物
+node_modules/
+
+# 插件数据(默认 ~/.dsh-token-stat;这里的是历史遗留的开发目录)
+token-stat-data/
+
+# 离线回放产物
+preview-report.md
+preview-report.json
+
+# 本地开发笔记(粘贴的官方教程,不入库)
+develop.txt
+
+# 工具
+tools/mingit/
+tools/work/
+
+# 系统/编辑器
+.DS_Store
+Thumbs.db
+*.log
