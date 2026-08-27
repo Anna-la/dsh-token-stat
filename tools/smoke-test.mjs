@@ -10,6 +10,7 @@ import assert from 'node:assert/strict'
 import * as fs from 'node:fs'
 import * as os from 'node:os'
 import * as path from 'node:path'
+import * as zlib from 'node:zlib'
 import * as plugin from '../index.mjs'
 
 // ---- 1) 模块形状 ----
@@ -32,8 +33,36 @@ console.log('ok: 模块形状 (name/apply/Config)')
 
 // ---- 3) apply() 冒烟 ----
 const TEMP = fs.mkdtempSync(path.join(os.tmpdir(), 'token-stat-smoke-'))
-// 默认数据目录重定向到 TEMP 内,避免测试触碰真实的 ~/.dsh-token-stat
+// 会话根目录与默认数据目录都重定向到 TEMP 内,避免测试触碰真实 ~/.dsh-token-stat
+process.env.DSH_HOME = TEMP
 process.env.DSH_TOKEN_STAT_DATA_DIR = path.join(TEMP, 'auto')
+
+// 磁盘会话日志(模拟真实布局 <sessions>/<项目>/<会话>/session*.zstd):
+// 这正对应线上缺陷场景 —— 重启时持久化服务尚未就绪(list 为空),
+// 插件必须能直接扫到磁盘上的全部历史会话。
+const SID = 'disk-session-1'
+const sessionDir = path.join(TEMP, 'sessions', 'proj-a', SID)
+fs.mkdirSync(sessionDir, { recursive: true })
+const sessionEvents = [
+  { type: 'request/context', seq: 0, time: Date.now() - 60000, data: { provider: 'smoke-p', model: 'smoke-m' } },
+  {
+    type: 'assistant/message',
+    seq: 1,
+    time: Date.now() - 30000,
+    data: {
+      turn: 1,
+      step: 0,
+      message: { role: 'assistant', content: [], source: { kind: 'model', provider: 'smoke-p', model: 'smoke-m' } },
+      usage: { inputTokens: 111, outputTokens: 22 },
+    },
+  },
+]
+{
+  const lines = [{ type: 'session', seq: -1, time: Date.now() - 120000, data: { id: SID } }, ...sessionEvents]
+  const payload = Buffer.from(lines.map((e) => JSON.stringify(e)).join('\n') + '\n', 'utf8')
+  fs.writeFileSync(path.join(sessionDir, 'session.jsonl.zstd'), zlib.zstdCompressSync(payload))
+}
+
 const registered = []
 const observerseen = []
 const settingsRegistered = []
@@ -42,6 +71,9 @@ const settingsStores = new Map()    // ns -> 用户层合并后的解析值
 const settingsWatchers = new Map()  // ns -> Set<cb>
 const routes = []
 let disposers = 0
+// 持久化服务 fake: 默认 list 为空(模拟重启时服务未就绪),测试中可切换到有数据
+let persistenceHeaders = []
+const persistenceEvents = () => sessionEvents
 
 function bodyReader(payload, parts = 1) {
   const chunks = (payload === undefined ? [] : [Buffer.from(payload)]).slice(0, parts)
@@ -135,23 +167,8 @@ const fakeCtx = {
     }
     if (name === 'sessionPersistence') {
       return {
-        list: async () => [{ id: 'smoke-session' }],
-        readFrom: async () => ({
-          events: [
-            { type: 'request/context', seq: 0, time: Date.now() - 60000, data: { provider: 'smoke-p', model: 'smoke-m' } },
-            {
-              type: 'assistant/message',
-              seq: 1,
-              time: Date.now() - 30000,
-              data: {
-                turn: 1,
-                step: 0,
-                message: { role: 'assistant', content: [], source: { kind: 'model', provider: 'smoke-p', model: 'smoke-m' } },
-                usage: { inputTokens: 111, outputTokens: 22 },
-              },
-            },
-          ],
-        }),
+        list: async () => persistenceHeaders,
+        readFrom: async () => ({ events: persistenceEvents() }),
       }
     }
     return undefined
@@ -180,7 +197,7 @@ const fakeCtx = {
 console.log('--- apply({ config }) ---')
 applyAndWait(fakeCtx, {
   enabled: true,
-  reportDir: TEMP,
+  reportDir: '',        // 自动 -> $DSH_TOKEN_STAT_DATA_DIR = <TEMP>/auto
   writeMd: true,
   writeJson: true,
   debounceMs: 50,
@@ -194,16 +211,22 @@ assert.ok(observerseen.some((o) => o.event === 'session/event' && o.global), 'se
 assert.ok(observerseen.some((o) => o.event === 'session/created'), '应监听 session/created')
 console.log(`ok: 工具注册 + 事件监听 (session/created, session/event global) `)
 
-const reportJson = path.join(TEMP, 'report.json')
-const reportMd = path.join(TEMP, 'report.md')
+const reportDir = path.join(TEMP, 'auto')
+const reportJson = path.join(reportDir, 'report.json')
+const reportMd = path.join(reportDir, 'report.md')
 assert.ok(fs.existsSync(reportJson), '应生成 report.json')
 assert.ok(fs.existsSync(reportMd), '应生成 report.md')
-const snap = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
-assert.equal(snap.totals.inputTokens, 111)
+const reportDoc = JSON.parse(fs.readFileSync(reportJson, 'utf8'))
+const snap = reportDoc.snapshot
+assert.equal(snap.totals.inputTokens, 111, '磁盘直扫应统计到会话用量(即使持久化服务 list 为空)')
 assert.equal(snap.totals.outputTokens, 22)
 assert.equal(snap.byModel[0].model, 'smoke-m')
-console.log('ok: 报告落盘 + 冒烟数据折叠正确')
-console.log('  报告目录:', TEMP)
+assert.equal(snap.sessionCount, 1)
+assert.equal(reportDoc.sources, TEMP, 'meta.sources 应为 DSH_HOME')
+const archiveDoc = JSON.parse(fs.readFileSync(path.join(reportDir, 'archive.json'), 'utf8'))
+assert.ok(archiveDoc.sessions[SID], '归档应记录磁盘会话')
+console.log('ok: 磁盘直扫 + 归档 (持久化服务为空时仍全量统计, 归档含会话)')
+console.log('  报告目录:', reportDir)
 
 // 工具 execute 输出
 const tool = registered.find((t) => t.name === 'token_usage_stats')
@@ -329,9 +352,10 @@ assert.ok(settingsUpdates.some((u) => String(u.ns) === 'token-stat' && u.patch.r
 await new Promise((r) => setTimeout(r, 700))
 assert.ok(fs.existsSync(path.join(MOVE, 'report.json')), '新目录应生成 report.json')
 assert.ok(fs.existsSync(path.join(MOVE, 'report.md')), '新目录应生成 report.md')
-assert.ok(!fs.existsSync(path.join(TEMP, 'report.json')), '旧目录的 report.json 应被移走')
-assert.ok(!fs.existsSync(path.join(TEMP, 'report.md')), '旧目录的 report.md 应被移走')
-console.log('ok: /config 设置新目录 (200, 报告迁移, 旧目录清空)')
+assert.ok(fs.existsSync(path.join(MOVE, 'archive.json')), '归档应随目录迁移')
+assert.ok(!fs.existsSync(path.join(reportDir, 'report.json')), '旧目录的 report.json 应被移走')
+assert.ok(!fs.existsSync(path.join(reportDir, 'report.md')), '旧目录的 report.md 应被移走')
+console.log('ok: /config 设置新目录 (200, 报告+归档迁移, 旧目录清空)')
 
 // 恢复自动(空串) -> 回到插件默认数据目录(DSH_HOME 之外)
 let cfgBody3 = null
@@ -361,16 +385,39 @@ await statsRoute.handler({ ...loopbackReq, method: 'GET' }, statsRes2)
 assert.equal(statsBody2.body.value.meta.reportDir, autoDir, 'stats meta 应反映当前生效目录')
 console.log('ok: stats meta 暴露 reportDirConfigured / 生效目录')
 
-// ---- 4) 卸载清理 ----
+// ---- 4) 归档保留: 会话文件被删除后,重启仍计入(删掉的项目不丢数据) ----
+fs.rmSync(path.join(TEMP, 'sessions'), { recursive: true, force: true }) // 模拟项目/会话被删除
 {
-  // 重新加载一次,验证 disposer 机制(真实 cordis 用 effect 管理)
+  // 重新加载一次,验证 disposer 机制 + 归档兜底(真实 cordis 用 effect 管理)
   const ctx2 = { ...fakeCtx }
-  applyAndWait(ctx2, { enabled: true, reportDir: TEMP, debounceMs: 25 })
-  await new Promise((r) => setTimeout(r, 300))
-  console.log('ok: 二次加载无副作用 (effect 计数', disposers, ')')
+  applyAndWait(ctx2, { enabled: true, reportDir: '', writeMd: true, writeJson: true, debounceMs: 25 })
+  await new Promise((r) => setTimeout(r, 700))
+  const snap2 = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
+  assert.equal(snap2.totals.inputTokens, 111, '会话文件删除后,归档应保留其用量')
+  assert.equal(snap2.sessionCount, 1, '归档中的会话仍计入会话数')
+  const archiveDoc2 = JSON.parse(fs.readFileSync(path.join(reportDir, 'archive.json'), 'utf8'))
+  assert.ok(archiveDoc2.sessions[SID], '归档应仍含被删除会话')
+  console.log('ok: 归档保留 (删除会话文件后重新加载仍计入, 总量不变; effect 计数', disposers, ')')
+}
+
+// ---- 5) 兜底: 无文件型会话存储时,走持久化服务 ----
+const TEMP2 = fs.mkdtempSync(path.join(os.tmpdir(), 'token-stat-fallback-'))
+{
+  const savedHome = process.env.DSH_HOME
+  process.env.DSH_HOME = TEMP2 // 没有 sessions 目录 -> 磁盘扫描 0 个文件 -> 服务兜底
+  persistenceHeaders = [{ id: 'service-session' }]
+  const ctx3 = { ...fakeCtx }
+  applyAndWait(ctx3, { enabled: true, reportDir: '', writeMd: true, writeJson: true, debounceMs: 25 })
+  await new Promise((r) => setTimeout(r, 500))
+  const snap3 = JSON.parse(fs.readFileSync(reportJson, 'utf8')).snapshot
+  assert.equal(snap3.totals.inputTokens, 222, '归档(SID) + 服务会话 = 222')
+  assert.equal(snap3.sessionCount, 2, '归档与会话服务数据应合并')
+  process.env.DSH_HOME = savedHome
+  console.log('ok: 持久化服务兜底 (无磁盘会话时走 sessionPersistence, 与归档合并)')
 }
 
 fs.rmSync(TEMP, { recursive: true, force: true })
+fs.rmSync(TEMP2, { recursive: true, force: true })
 fs.rmSync(plugin.pluginDataDir(), { recursive: true, force: true })
 console.log('\n冒烟测试通过 ✓')
 
